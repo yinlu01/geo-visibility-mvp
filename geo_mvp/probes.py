@@ -123,6 +123,38 @@ def demo_answer(prompt: str, brand: str, competitors: list[str], platform: str,
 
 # ------------------------------------------------------------------ API 探针
 
+# 各入口的 OpenAI 兼容 API 预设；search 标注该 API 是否支持联网搜索（≈真实 AI 搜索回答）
+API_PRESETS = {
+    "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat",
+                 "search": False, "note": "官方 API 无联网检索，回答基于模型知识"},
+    "豆包(火山方舟)": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-seed-1-6-250615",
+                 "search": "bot", "note": "在方舟控制台创建「联网回复」Bot 并用 Bot 端点 ID 作 model，即带真实联网检索"},
+    "Kimi(月之暗面)": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k",
+                 "search": True, "note": "API 原生支持 $web_search 联网工具，回答接近 AI 搜索"},
+    "通义千问": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus",
+                 "search": True, "note": "compatible-mode 支持 enable_search 联网参数"},
+    "智谱GLM": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash",
+                 "search": True, "note": "支持 web_search 工具"},
+    "OpenAI": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini",
+                 "search": False, "note": "标准 chat API 无联网检索"},
+}
+
+SEARCH_SYS = ("你在模拟 AI 搜索引擎回答普通用户的提问。请联网检索后给出普通用户会看到的回答，"
+              "结构自然、口语化，并尽量在括号中标注你参考的来源域名（如 xueqiu.com、eastmoney.com）。")
+
+
+def _search_tools_for(base_url: str, model: str):
+    """按平台返回联网搜索参数；返回 (tools_kwargs, err)"""
+    if "moonshot" in base_url:
+        return {"tools": [{"type": "builtin_function",
+                           "function": {"name": "$web_search"}}]}, None
+    if "bigmodel" in base_url:
+        return {"tools": [{"type": "web_search", "web_search": {"enable": True}}]}, None
+    if "dashscope" in base_url:
+        return {"extra_body": {"enable_search": True}}, None
+    return {}, None
+
+
 def api_answer(prompt: str, platform: str, port: str, sample_idx: int,
                base_url: str, api_key: str, model: str,
                search_hint: bool = True) -> Answer:
@@ -136,16 +168,22 @@ def api_answer(prompt: str, platform: str, port: str, sample_idx: int,
                      {"role": "user", "content": prompt}],
         "temperature": 0.7,
     }
-    r = requests.post(
-        base_url.rstrip("/") + "/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload, timeout=60,
-    )
+    if search_hint:
+        tools_kwargs, _ = _search_tools_for(base_url, model)
+        payload.update(tools_kwargs)
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    r = requests.post(base_url.rstrip("/") + "/chat/completions",
+                      headers=headers, json=payload, timeout=90)
     r.raise_for_status()
     data = r.json()
-    text = data["choices"][0]["message"]["content"]
-    domains = re.findall(r"https?://([a-zA-Z0-9.\-]+)", text)
-    return Answer(0, platform, port, sample_idx, text, sorted(set(domains)))
+    msg = data["choices"][0]["message"]
+    text = msg.get("content") or ""
+    # 部分平台联网搜索时 content 在 reasoning/tool 调用后拼接
+    if not text and isinstance(msg.get("tool_calls"), list):
+        text = json.dumps(msg.get("tool_calls"), ensure_ascii=False)
+    domains = re.findall(r"(?:https?://)?([a-zA-Z0-9\-]+\.[a-zA-Z0-9.\-]+)", text)
+    domains = [d.strip("。，；、)】」") for d in domains if "." in d and len(d) < 40]
+    return Answer(0, platform, port, sample_idx, text, sorted(set(domains))[:10])
 
 
 # ------------------------------------------------------------------ 手工导入

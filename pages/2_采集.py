@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 
 import pandas as pd
 import streamlit as st
@@ -25,7 +26,8 @@ if not prompts:
     st.warning("题库为空，请先到「测试集」生成。")
     st.stop()
 
-mode = st.radio("采集模式", ["演示引擎", "API 接口", "手工导入"], horizontal=True)
+mode = st.radio("采集模式", ["API 接口", "演示引擎", "手工导入"], horizontal=True,
+                help="生产推荐 API 接口：全量题库自动并发采集，20 题 × 3 次采样约 1-2 分钟跑完")
 
 platforms = st.multiselect("AI 入口", list(probes.PLATFORMS.keys()),
                            default=["DeepSeek", "豆包", "元宝", "文心一言"])
@@ -61,40 +63,78 @@ if mode == "演示引擎":
 
 # ---------------- API ----------------
 elif mode == "API 接口":
+    cfg_path = os.path.join(db.ROOT, "data", "api_config.json")
+    saved = {}
+    if os.path.exists(cfg_path):
+        try:
+            saved = json.load(open(cfg_path, encoding="utf-8"))
+        except Exception:
+            saved = {}
+
+    st.markdown("**① 选平台预设**（一键填入接口与模型；标注 🔍 的平台 API 支持联网搜索，回答接近真实 AI 搜索）")
+    preset_name = st.selectbox(
+        "平台预设",
+        list(probes.API_PRESETS.keys()),
+        index=list(probes.API_PRESETS.keys()).index(saved.get("preset", "DeepSeek"))
+        if saved.get("preset") in probes.API_PRESETS else 0,
+    )
+    preset = probes.API_PRESETS[preset_name]
+    st.caption(("🔍 " if preset["search"] else "ℹ️ ") + preset["note"])
+
     c1, c2, c3 = st.columns([2, 1, 1])
-    base_url = c1.text_input("API Base URL", value="https://api.deepseek.com")
-    model = c2.text_input("模型", value="deepseek-chat")
-    api_key = c3.text_input("API Key", type="password")
-    st.markdown('<div class="hint">支持所有 OpenAI 兼容接口：DeepSeek / 月之暗面 Kimi / 通义千问 / 智谱 / OpenAI / '
-                '本地 vLLM&Ollama。注意：普通对话接口不带联网检索，若需"AI 搜索"真实结果，'
-                '请使用对应平台的联网模型或改用手工导入模式。</div>', unsafe_allow_html=True)
-    if st.button("▶️ 开始采集", type="primary", use_container_width=True):
+    base_url = c1.text_input("API Base URL", value=saved.get("base_url", preset["base_url"]))
+    model = c2.text_input("模型 / 端点ID", value=saved.get("model", preset["model"]))
+    api_key = c3.text_input("API Key", type="password", value=saved.get("api_key", ""))
+    search_hint = st.checkbox("启用联网搜索（仅对支持的 API 生效）", value=True, disabled=not preset["search"])
+    workers = st.slider("并发请求数", 1, 10, 5)
+
+    csave, crun = st.columns([1, 2])
+    if csave.button("💾 保存配置"):
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        json.dump({"preset": preset_name, "base_url": base_url, "model": model,
+                   "api_key": api_key}, open(cfg_path, "w", encoding="utf-8"))
+        st.success("已保存到 data/api_config.json（已在 .gitignore 中排除）")
+
+    if crun.button("▶️ 开始采集", type="primary", use_container_width=True):
         if not api_key:
             st.error("请填写 API Key")
         else:
-            rows, errs = [], 0
-            prog = st.progress(0)
-            for i, p in enumerate(prompts):
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            jobs = []
+            for p in prompts:
                 for pf in platforms:
                     for port in probes.PLATFORMS.get(pf, {}).get("ports", ["web"])[:1]:
                         for s in range(samples):
-                            try:
-                                a = probes.api_answer(p["text"], pf, port, s, base_url, api_key, model)
-                                a.prompt_id = p["id"]
-                                rows.append(a.to_row())
-                            except Exception as e:
-                                errs += 1
-                prog.progress((i + 1) / len(prompts))
+                            jobs.append((p, pf, port, s))
+            rows, errs, err_msg = [], 0, ""
+            prog = st.progress(0)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(probes.api_answer, p["text"], pf, port, s,
+                                  base_url, api_key, model, search_hint): (p, pf, port, s)
+                        for p, pf, port, s in jobs}
+                for k, fut in enumerate(as_completed(futs)):
+                    p, pf, port, s = futs[fut]
+                    try:
+                        a = fut.result()
+                        a.prompt_id = p["id"]
+                        rows.append(a.to_row())
+                    except Exception as e:
+                        errs += 1
+                        err_msg = str(e)[:200]
+                    prog.progress((k + 1) / len(jobs))
             if rows:
-                rid = db.create_run(proj["id"], run_name, "api", platforms, f"model={model}; errors={errs}")
+                rid = db.create_run(proj["id"], run_name, "api", platforms,
+                                    f"preset={preset_name}; model={model}; search={search_hint}; errors={errs}")
                 db.insert_answers(rid, rows)
                 for a in db.list_answers(rid):
                     db.upsert_annotation(a["id"], **annotate.annotate_answer(
                         a["raw_text"], proj["brand"], aliases, proj["competitors"], facts, a["citations"]))
                 st.success(f"采集完成：{len(rows)} 条（失败 {errs}）")
+                if errs and err_msg:
+                    st.caption(f"最后错误示例：{err_msg}")
                 st.rerun()
             else:
-                st.error(f"全部请求失败（{errs}），请检查接口配置。")
+                st.error(f"全部请求失败（{errs}）：{err_msg}")
 
 # ---------------- 手工导入 ----------------
 else:
