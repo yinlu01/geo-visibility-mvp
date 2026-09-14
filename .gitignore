@@ -1,0 +1,10 @@
+# 数据与环境
+data/
+outputs/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.env
+.DS_Store
